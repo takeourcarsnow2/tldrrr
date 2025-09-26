@@ -46,9 +46,16 @@ interface CacheEntry {
 }
 
 const CACHE = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 1000 * 60 * 3; // 3 minutes
+// Increase server-side cache TTL to reduce LLM/function invocations from frequent identical requests.
+// 15 minutes is a reasonable tradeoff between freshness and cost.
+const CACHE_TTL_MS = 1000 * 60 * 15; // 15 minutes
 
 const INFLIGHT = new Map<string, Promise<{ status: number; payload: ApiResponse }>>();
+// Lightweight per-IP throttle to avoid accidental or malicious tight loops.
+// Keyed by client IP (or X-Forwarded-For header when present). Window is small to avoid
+// interfering with normal UX but helps reduce rapid repeated invocations.
+const LAST_REQUEST_BY_IP = new Map<string, number>();
+const IP_THROTTLE_MS = 5 * 1000; // 5 seconds
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
   try {
@@ -56,6 +63,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       res.setHeader('Allow', 'POST');
       return res.status(405).json({ ok: false, error: 'Method Not Allowed' });
     }
+
+    // In production, restrict API access to requests initiated by the web UI
+    // (AJAX requests from the browser). This helps avoid accidental or
+    // automated server work on hosted deployments. Development (NODE_ENV !==
+    // 'production') is unaffected so local testing and CI can call the API.
+    try {
+      if (process.env.NODE_ENV === 'production') {
+        const xreq = (req.headers['x-requested-with'] || '').toString();
+        if (!xreq || xreq.toLowerCase() !== 'xmlhttprequest') {
+          return res.status(403).json({ ok: false, error: 'API access restricted: must originate from UI' });
+        }
+      }
+    } catch (e) { /* ignore header check failures */ }
 
     if (!getModel()) {
       return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY missing. Configure it in Vercel Project Settings > Environment Variables.' });
@@ -93,6 +113,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
       requestLog.info('cache hit', { ageMs: Date.now() - cached.ts });
       return res.status(200).json({ cached: true, ...cached.payload });
+    }
+
+    // Per-IP quick throttle: detect same-client rapid repeats and reject early.
+    try {
+      const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown') as string;
+      const last = LAST_REQUEST_BY_IP.get(ip) || 0;
+      const now = Date.now();
+      LAST_REQUEST_BY_IP.set(ip, now);
+      if (now - last < IP_THROTTLE_MS) {
+        requestLog.warn('client request throttled (too frequent)', { ip, sinceLastMs: now - last });
+        return res.status(429).json({ ok: false, error: 'Too many requests; slow down a little' });
+      }
+    } catch (e) {
+      // ignore any errors in throttle bookkeeping
     }
 
     const compute = async (): Promise<{ status: number; payload: ApiResponse }> => {
@@ -139,7 +173,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const MAX_CONTEXT_ITEMS = 8;
       const contextItems = topItems.slice(0, Math.min(MAX_CONTEXT_ITEMS, topItems.length));
   const contextLines = contextItems.map((a: any, idx: number) => {
-        const dateStr = a.isoDate ? new Date(a.isoDate).toLocaleString(uiLocale, { dateStyle: 'medium', timeStyle: 'short' }) : '';
+    const dateStr = a.isoDate ? new Date(a.isoDate).toLocaleString(uiLocale, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
         const snip = (a.snippet || '').replace(/\s+/g, ' ');
         return `#${idx + 1} ${a.title}\nSource: ${a.source} | Published: ${dateStr}\nLink: ${a.link}\nSummary: ${snip}`;
       });
